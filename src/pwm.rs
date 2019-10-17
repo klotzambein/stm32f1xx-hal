@@ -132,9 +132,9 @@
 use core::marker::PhantomData;
 use core::mem;
 
-use cast::{u16, u32};
 use crate::hal;
 use crate::pac::{TIM2, TIM3, TIM4};
+use cast::{u16, u32};
 
 use crate::afio::MAPR;
 use crate::bb;
@@ -202,12 +202,7 @@ impl Pins<TIM4>
 }
 
 impl Timer<TIM2> {
-    pub fn pwm<PINS, T>(
-        self,
-        _pins: PINS,
-        mapr: &mut MAPR,
-        freq: T,
-    ) -> PINS::Channels
+    pub fn pwm<PINS, T>(self, _pins: PINS, mapr: &mut MAPR, freq: T) -> PINS::Channels
     where
         PINS: Pins<TIM2>,
         T: Into<Hertz>,
@@ -220,12 +215,7 @@ impl Timer<TIM2> {
 }
 
 impl Timer<TIM3> {
-    pub fn pwm<PINS, T>(
-        self,
-        _pins: PINS,
-        mapr: &mut MAPR,
-        freq: T,
-    ) -> PINS::Channels
+    pub fn pwm<PINS, T>(self, _pins: PINS, mapr: &mut MAPR, freq: T) -> PINS::Channels
     where
         PINS: Pins<TIM3>,
         T: Into<Hertz>,
@@ -238,12 +228,7 @@ impl Timer<TIM3> {
 }
 
 impl Timer<TIM4> {
-    pub fn pwm<PINS, T>(
-        self,
-        _pins: PINS,
-        mapr: &mut MAPR,
-        freq: T,
-    ) -> PINS::Channels
+    pub fn pwm<PINS, T>(self, _pins: PINS, mapr: &mut MAPR, freq: T) -> PINS::Channels
     where
         PINS: Pins<TIM4>,
         T: Into<Hertz>,
@@ -419,4 +404,106 @@ hal! {
     TIM2: (tim2),
     TIM3: (tim3),
     TIM4: (tim4),
+}
+
+use crate::dma::{dma1, Static, Transfer, TransferPayload, Transmit, TxDma, WriteDma, R};
+use core::sync::atomic::{self, Ordering};
+
+macro_rules! pwmdma {
+    ($(
+        $TIMX:ident, $CHANNEL:ident: (
+            $txdma:ident,
+            $ccr:ident,
+            $ccde:ident,
+            $dmatxch:ty$(,)?
+        ),
+    )+) => {
+        $(
+            pub type $txdma = TxDma<Pwm<$TIMX, $CHANNEL>, $dmatxch>;
+
+            impl Transmit for $txdma {
+                type TxChannel = $dmatxch;
+                type ReceivedWord = u8;
+            }
+
+            impl TransferPayload for $txdma {
+                fn start(&mut self) {
+                    self.channel.start();
+                }
+                fn stop(&mut self) {
+                    self.channel.stop();
+                }
+            }
+
+            impl Pwm<$TIMX, $CHANNEL> {
+                pub fn with_dma(self, channel: $dmatxch) -> $txdma {
+                    TxDma {
+                        payload: self,
+                        channel,
+                    }
+                }
+            }
+
+            impl $txdma {
+                pub fn split(mut self) -> (Pwm<$TIMX, $CHANNEL>, $dmatxch) {
+                    self.stop();
+                    let TxDma {payload, channel} = self;
+                    (
+                        payload,
+                        channel,
+                    )
+                }
+            }
+
+            impl<A, B> WriteDma<A, B, u8> for $txdma where A: as_slice::AsSlice<Element=u8>, B: Static<A> {
+                fn write(mut self, buffer: B
+                ) -> Transfer<R, B, Self>
+                {
+                    {
+                        let buffer = buffer.borrow().as_slice();
+
+                        self.channel.set_peripheral_address(unsafe{ &(*$TIMX::ptr()).$ccr as *const _ as u32 }, false);
+
+                        self.channel.set_memory_address(buffer.as_ptr() as u32, true);
+                        self.channel.set_transfer_length(buffer.len());
+                    }
+
+                    atomic::compiler_fence(Ordering::Release);
+
+                    self.channel.ch().cr.modify(|_, w| { w
+                        .mem2mem() .clear_bit()
+                        .pl()      .medium()
+                        .msize()   .bits8()
+                        .psize()   .bits32()
+                        .circ()    .clear_bit()
+                        .dir()     .set_bit()
+                        .minc()    .set_bit()
+                        .pinc()    .clear_bit()
+                    });
+
+                    unsafe { (*$TIMX::ptr()).dier.modify(|_, w| {
+                        w   .tde().set_bit()
+                            .cc1de().set_bit()
+                    }); }
+
+                    self.start();
+
+                    Transfer::r(buffer, self)
+                }
+            }
+        )+
+    }
+}
+
+pwmdma! {
+    TIM2, C1: (TxDma2C1, ccr1, cc1de, dma1::C5),
+    TIM2, C2: (TxDma2C2, ccr2, cc2de, dma1::C7),
+    TIM2, C3: (TxDma2C3, ccr3, cc3de, dma1::C1),
+    TIM2, C4: (TxDma2C4, ccr4, cc4de, dma1::C7),
+    TIM3, C1: (TxDma3C1, ccr1, cc1de, dma1::C6),
+    TIM3, C3: (TxDma3C3, ccr3, cc3de, dma1::C2),
+    TIM3, C4: (TxDma3C4, ccr4, cc4de, dma1::C3),
+    TIM4, C1: (TxDma4C1, ccr1, cc1de, dma1::C1),
+    TIM4, C2: (TxDma4C2, ccr2, cc2de, dma1::C4),
+    TIM4, C3: (TxDma4C3, ccr3, cc3de, dma1::C5),
 }
