@@ -43,6 +43,25 @@ impl<BUFFER, PAYLOAD> CircBuffer<BUFFER, PAYLOAD> {
     }
 }
 
+pub struct CircWriteBuffer<BUFFER, PAYLOAD>
+where
+    BUFFER: 'static,
+{
+    buffer: &'static mut [BUFFER; 2],
+    payload: PAYLOAD,
+    writeable_half: Half,
+}
+
+impl<BUFFER, PAYLOAD> CircWriteBuffer<BUFFER, PAYLOAD> {
+    pub(crate) fn new(buf: &'static mut [BUFFER; 2], payload: PAYLOAD) -> Self {
+        CircWriteBuffer {
+            buffer: buf,
+            payload,
+            writeable_half: Half::Second,
+        }
+    }
+}
+
 pub trait Static<B> {
     fn borrow(&self) -> &B;
 }
@@ -128,7 +147,7 @@ macro_rules! dma {
 
                 use crate::pac::{$DMAX, dma1};
 
-                use crate::dma::{CircBuffer, DmaExt, Error, Event, Half, Transfer, W, RxDma, TxDma, TransferPayload};
+                use crate::dma::{CircBuffer, CircWriteBuffer, DmaExt, Error, Event, Half, Transfer, W, RxDma, TxDma, TransferPayload};
                 use crate::rcc::{AHB, Enable};
 
                 pub struct Channels((), $(pub $CX),+);
@@ -288,6 +307,82 @@ macro_rules! dma {
 
                         /// Stops the transfer and returns the underlying buffer and RxDma
                         pub fn stop(mut self) -> (&'static mut [B; 2], RxDma<PAYLOAD, $CX>) {
+                            self.payload.stop();
+
+                            (self.buffer, self.payload)
+                        }
+                    }
+
+                    impl<B, PAYLOAD> CircWriteBuffer<B, TxDma<PAYLOAD, $CX>>
+                    where
+                        TxDma<PAYLOAD, $CX>: TransferPayload,
+                    {
+                        /// Peeks into the writeable half of the buffer
+                        pub fn peek<R, F>(&mut self, f: F) -> Result<R, Error>
+                            where
+                            F: FnOnce(&mut B, Half) -> R,
+                        {
+                            let half_being_written = self.writeable_half()?;
+
+                            let buf = match half_being_written {
+                                Half::First => &mut self.buffer[0],
+                                Half::Second => &mut self.buffer[1],
+                            };
+
+                            // XXX does this need a compiler barrier?
+                            let ret = f(buf, half_being_written);
+
+
+                            let isr = self.payload.channel.isr();
+                            let first_half_is_done = isr.$htifX().bit_is_set();
+                            let second_half_is_done = isr.$tcifX().bit_is_set();
+
+                            if (half_being_written == Half::First && second_half_is_done) ||
+                                (half_being_written == Half::Second && first_half_is_done) {
+                                Err(Error::Overrun)
+                            } else {
+                                Ok(ret)
+                            }
+                        }
+
+                        /// Returns the `Half` of the buffer that can be read
+                        pub fn writeable_half(&mut self) -> Result<Half, Error> {
+                            let isr = self.payload.channel.isr();
+                            let first_half_is_done = isr.$htifX().bit_is_set();
+                            let second_half_is_done = isr.$tcifX().bit_is_set();
+
+                            if first_half_is_done && second_half_is_done {
+                                return Err(Error::Overrun);
+                            }
+
+                            let last_read_half = self.writeable_half;
+
+                            Ok(match last_read_half {
+                                Half::First => {
+                                    if second_half_is_done {
+                                        self.payload.channel.ifcr().write(|w| w.$ctcifX().set_bit());
+
+                                        self.writeable_half = Half::Second;
+                                        Half::Second
+                                    } else {
+                                        last_read_half
+                                    }
+                                }
+                                Half::Second => {
+                                    if first_half_is_done {
+                                        self.payload.channel.ifcr().write(|w| w.$chtifX().set_bit());
+
+                                        self.writeable_half = Half::First;
+                                        Half::First
+                                    } else {
+                                        last_read_half
+                                    }
+                                }
+                            })
+                        }
+
+                        /// Stops the transfer and returns the underlying buffer and RxDma
+                        pub fn stop(mut self) -> (&'static mut [B; 2], TxDma<PAYLOAD, $CX>) {
                             self.payload.stop();
 
                             (self.buffer, self.payload)
@@ -482,26 +577,31 @@ pub trait Transmit {
 
 pub trait CircReadDma<B, RS>: Receive
 where
-    B: as_slice::AsMutSlice<Element=RS>,
+    B: as_slice::AsMutSlice<Element = RS>,
     Self: core::marker::Sized,
 {
     fn circ_read(self, buffer: &'static mut [B; 2]) -> CircBuffer<B, Self>;
 }
 
-pub trait ReadDma<B, RS>: Receive
+pub trait CircWriteDma<B, RS>: Transmit
 where
-    B: as_slice::AsMutSlice<Element=RS>,
+    B: as_slice::AsMutSlice<Element = RS>,
     Self: core::marker::Sized,
 {
-    fn read(
-        self,
-        buffer: &'static mut B,
-    ) -> Transfer<W, &'static mut B, Self>;
+    fn circ_write(self, buffer: &'static mut [B; 2]) -> CircWriteBuffer<B, Self>;
+}
+
+pub trait ReadDma<B, RS>: Receive
+where
+    B: as_slice::AsMutSlice<Element = RS>,
+    Self: core::marker::Sized,
+{
+    fn read(self, buffer: &'static mut B) -> Transfer<W, &'static mut B, Self>;
 }
 
 pub trait WriteDma<A, B, TS>: Transmit
 where
-    A: as_slice::AsSlice<Element=TS>,
+    A: as_slice::AsSlice<Element = TS>,
     B: Static<A>,
     Self: core::marker::Sized,
 {

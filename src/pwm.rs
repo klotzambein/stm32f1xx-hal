@@ -406,7 +406,10 @@ hal! {
     TIM4: (tim4),
 }
 
-use crate::dma::{dma1, Static, Transfer, TransferPayload, Transmit, TxDma, WriteDma, R};
+use crate::dma::{
+    dma1, CircWriteBuffer, CircWriteDma, Static, Transfer, TransferPayload, Transmit, TxDma,
+    WriteDma, R,
+};
 use core::sync::atomic::{self, Ordering};
 
 macro_rules! pwmdma {
@@ -468,6 +471,11 @@ macro_rules! pwmdma {
                         self.channel.set_transfer_length(buffer.len());
                     }
 
+                    unsafe { (*$TIMX::ptr()).dier.modify(|_, w| {
+                        w   .tde().set_bit()
+                            .$ccde().set_bit()
+                    }); }
+
                     atomic::compiler_fence(Ordering::Release);
 
                     self.channel.ch().cr.modify(|_, w| { w
@@ -481,14 +489,45 @@ macro_rules! pwmdma {
                         .pinc()    .clear_bit()
                     });
 
-                    unsafe { (*$TIMX::ptr()).dier.modify(|_, w| {
-                        w   .tde().set_bit()
-                            .cc1de().set_bit()
-                    }); }
-
                     self.start();
 
                     Transfer::r(buffer, self)
+                }
+            }
+
+            impl<B, RS> CircWriteDma<B, RS> for $txdma
+            where
+                B: as_slice::AsMutSlice<Element = RS>,
+                Self: core::marker::Sized,
+            {
+                fn circ_write(mut self, buffer: &'static mut [B; 2]) -> CircWriteBuffer<B, Self> {
+                    {
+                        let buffer = buffer[0].as_mut_slice();
+                        self.channel.set_peripheral_address(unsafe{ &(*$TIMX::ptr()).$ccr as *const _ as u32 }, false);
+                        self.channel.set_memory_address(buffer.as_ptr() as u32, true);
+                        self.channel.set_transfer_length(buffer.len() * 2);
+
+                        unsafe { (*$TIMX::ptr()).dier.modify(|_, w| {
+                            w   .tde().set_bit()
+                                .$ccde().set_bit()
+                        }); }
+
+                        atomic::compiler_fence(Ordering::Release);
+
+                        self.channel.ch().cr.modify(|_, w| { w
+                            .mem2mem() .clear_bit()
+                            .pl()      .medium()
+                            .msize()   .bits8()
+                            .psize()   .bits32()
+                            .circ()    .set_bit()
+                            .dir()     .set_bit()
+                            .minc()    .set_bit()
+                            .pinc()    .clear_bit()
+                        });
+                        
+                        self.start();
+                    }
+                    CircWriteBuffer::new(buffer, self)
                 }
             }
         )+
