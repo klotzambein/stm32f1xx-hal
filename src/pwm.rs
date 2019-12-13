@@ -56,6 +56,7 @@
 use core::marker::PhantomData;
 use core::mem;
 
+use cast::{u16, u32};
 use crate::hal;
 #[cfg(any(
     feature = "stm32f100",
@@ -241,9 +242,9 @@ macro_rules! hal {
                         .modify(|_, w| w.oc4pe().set_bit().oc4m().pwm_mode1() );
                 }
                 let ticks = clk.0 / freq.0;
-                let psc = (ticks / (1 << 16)) as u16;
+                let psc = u16(ticks / (1 << 16)).unwrap();
                 tim.psc.write(|w| w.psc().bits(psc) );
-                let arr = (ticks / (psc + 1) as u32) as u16;
+                let arr = u16(ticks / u32(psc + 1)).unwrap();
                 tim.arr.write(|w| w.arr().bits(arr));
 
                 tim.cr1.write(|w|
